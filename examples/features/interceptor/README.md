@@ -42,7 +42,7 @@ the args passed in, such as RPC context, method string, request to be sent, and
 CallOptions configured. With the info, users can even modify the RPC call. For
 instance, in the example, we examine the list of CallOptions and see if call
 credential has been configured. If not, configure it to use oauth2 with token
-"some-secrete-token" as fallback. In our example, we intentionally omit
+"some-secret-token" as fallback. In our example, we intentionally omit
 configuring the per RPC credential to resort to fallback.
 
 After pre-processing is done, use can invoke the RPC call by calling the
@@ -76,7 +76,7 @@ user to operate on.
 
 In the example, we define a new struct `wrappedStream`, which is embedded with a
 `ClientStream`. Then, we implement (overload) the `SendMsg` and `RecvMsg`
-methods on `wrappedStream` to intercepts these two operations on the embedded
+methods on `wrappedStream` to intercept these two operations on the embedded
 `ClientStream`. In the example, we log the message type info and time info for
 interception purpose.
 

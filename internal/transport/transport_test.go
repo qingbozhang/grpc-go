@@ -34,13 +34,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
+	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/leakcheck"
 	"google.golang.org/grpc/internal/testutils"
+	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/status"
 )
+
+type s struct {
+	grpctest.Tester
+}
+
+func Test(t *testing.T) {
+	grpctest.RunSubTests(t, s{})
+}
 
 type server struct {
 	lis        net.Listener
@@ -421,12 +434,9 @@ func setUp(t *testing.T, port int, maxStreams uint32, ht hType) (*server, *http2
 
 func setUpWithOptions(t *testing.T, port int, serverConfig *ServerConfig, ht hType, copts ConnectOptions) (*server, *http2Client, func()) {
 	server := setUpServerOnly(t, port, serverConfig, ht)
-	addr := "localhost:" + server.port
-	target := TargetInfo{
-		Addr: addr,
-	}
+	addr := resolver.Address{Addr: "localhost:" + server.port}
 	connectCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
-	ct, connErr := NewClientTransport(connectCtx, context.Background(), target, copts, func() {}, func(GoAwayReason) {}, func() {})
+	ct, connErr := NewClientTransport(connectCtx, context.Background(), addr, copts, func() {}, func(GoAwayReason) {}, func() {})
 	if connErr != nil {
 		cancel() // Do not cancel in success path.
 		t.Fatalf("failed to create transport: %v", connErr)
@@ -451,7 +461,7 @@ func setUpWithNoPingServer(t *testing.T, copts ConnectOptions, connCh chan net.C
 		connCh <- conn
 	}()
 	connectCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
-	tr, err := NewClientTransport(connectCtx, context.Background(), TargetInfo{Addr: lis.Addr().String()}, copts, func() {}, func(GoAwayReason) {}, func() {})
+	tr, err := NewClientTransport(connectCtx, context.Background(), resolver.Address{Addr: lis.Addr().String()}, copts, func() {}, func(GoAwayReason) {}, func() {})
 	if err != nil {
 		cancel() // Do not cancel in success path.
 		// Server clean-up.
@@ -466,14 +476,16 @@ func setUpWithNoPingServer(t *testing.T, copts ConnectOptions, connCh chan net.C
 
 // TestInflightStreamClosing ensures that closing in-flight stream
 // sends status error to concurrent stream reader.
-func TestInflightStreamClosing(t *testing.T) {
+func (s) TestInflightStreamClosing(t *testing.T) {
 	serverConfig := &ServerConfig{}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, suspended, ConnectOptions{})
 	defer cancel()
 	defer server.stop()
 	defer client.Close()
 
-	stream, err := client.NewStream(context.Background(), &CallHdr{})
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	stream, err := client.NewStream(ctx, &CallHdr{})
 	if err != nil {
 		t.Fatalf("Client failed to create RPC request: %v", err)
 	}
@@ -502,21 +514,23 @@ func TestInflightStreamClosing(t *testing.T) {
 	}
 }
 
-func TestClientSendAndReceive(t *testing.T) {
+func (s) TestClientSendAndReceive(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, normal)
 	defer cancel()
 	callHdr := &CallHdr{
 		Host:   "localhost",
 		Method: "foo.Small",
 	}
-	s1, err1 := ct.NewStream(context.Background(), callHdr)
+	ctx, ctxCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer ctxCancel()
+	s1, err1 := ct.NewStream(ctx, callHdr)
 	if err1 != nil {
 		t.Fatalf("failed to open stream: %v", err1)
 	}
 	if s1.id != 1 {
 		t.Fatalf("wrong stream id: %d", s1.id)
 	}
-	s2, err2 := ct.NewStream(context.Background(), callHdr)
+	s2, err2 := ct.NewStream(ctx, callHdr)
 	if err2 != nil {
 		t.Fatalf("failed to open stream: %v", err2)
 	}
@@ -540,7 +554,7 @@ func TestClientSendAndReceive(t *testing.T) {
 	server.stop()
 }
 
-func TestClientErrorNotify(t *testing.T) {
+func (s) TestClientErrorNotify(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, normal)
 	defer cancel()
 	go server.stop()
@@ -554,7 +568,9 @@ func performOneRPC(ct ClientTransport) {
 		Host:   "localhost",
 		Method: "foo.Small",
 	}
-	s, err := ct.NewStream(context.Background(), callHdr)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	s, err := ct.NewStream(ctx, callHdr)
 	if err != nil {
 		return
 	}
@@ -572,7 +588,7 @@ func performOneRPC(ct ClientTransport) {
 	}
 }
 
-func TestClientMix(t *testing.T) {
+func (s) TestClientMix(t *testing.T) {
 	s, ct, cancel := setUp(t, 0, math.MaxUint32, normal)
 	defer cancel()
 	go func(s *server) {
@@ -589,19 +605,21 @@ func TestClientMix(t *testing.T) {
 	}
 }
 
-func TestLargeMessage(t *testing.T) {
+func (s) TestLargeMessage(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, normal)
 	defer cancel()
 	callHdr := &CallHdr{
 		Host:   "localhost",
 		Method: "foo.Large",
 	}
+	ctx, ctxCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer ctxCancel()
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s, err := ct.NewStream(context.Background(), callHdr)
+			s, err := ct.NewStream(ctx, callHdr)
 			if err != nil {
 				t.Errorf("%v.NewStream(_, _) = _, %v, want _, <nil>", ct, err)
 			}
@@ -622,7 +640,7 @@ func TestLargeMessage(t *testing.T) {
 	server.stop()
 }
 
-func TestLargeMessageWithDelayRead(t *testing.T) {
+func (s) TestLargeMessageWithDelayRead(t *testing.T) {
 	// Disable dynamic flow control.
 	sc := &ServerConfig{
 		InitialWindowSize:     defaultWindowSize,
@@ -719,7 +737,7 @@ func TestLargeMessageWithDelayRead(t *testing.T) {
 	}
 }
 
-func TestGracefulClose(t *testing.T) {
+func (s) TestGracefulClose(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, pingpong)
 	defer cancel()
 	defer func() {
@@ -761,7 +779,7 @@ func TestGracefulClose(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			str, err := ct.NewStream(context.Background(), &CallHdr{})
+			str, err := ct.NewStream(ctx, &CallHdr{})
 			if err == ErrConnClosing {
 				return
 			} else if err != nil {
@@ -782,7 +800,7 @@ func TestGracefulClose(t *testing.T) {
 	wg.Wait()
 }
 
-func TestLargeMessageSuspension(t *testing.T) {
+func (s) TestLargeMessageSuspension(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, suspended)
 	defer cancel()
 	callHdr := &CallHdr{
@@ -817,7 +835,7 @@ func TestLargeMessageSuspension(t *testing.T) {
 	server.stop()
 }
 
-func TestMaxStreams(t *testing.T) {
+func (s) TestMaxStreams(t *testing.T) {
 	serverConfig := &ServerConfig{
 		MaxStreams: 1,
 	}
@@ -829,7 +847,9 @@ func TestMaxStreams(t *testing.T) {
 		Host:   "localhost",
 		Method: "foo.Large",
 	}
-	s, err := ct.NewStream(context.Background(), callHdr)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	s, err := ct.NewStream(ctx, callHdr)
 	if err != nil {
 		t.Fatalf("Failed to open stream: %v", err)
 	}
@@ -888,7 +908,7 @@ func TestMaxStreams(t *testing.T) {
 	}
 }
 
-func TestServerContextCanceledOnClosedConnection(t *testing.T) {
+func (s) TestServerContextCanceledOnClosedConnection(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, suspended)
 	defer cancel()
 	callHdr := &CallHdr{
@@ -914,7 +934,9 @@ func TestServerContextCanceledOnClosedConnection(t *testing.T) {
 		server.mu.Unlock()
 		break
 	}
-	s, err := ct.NewStream(context.Background(), callHdr)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	s, err := ct.NewStream(ctx, callHdr)
 	if err != nil {
 		t.Fatalf("Failed to open stream: %v", err)
 	}
@@ -950,7 +972,7 @@ func TestServerContextCanceledOnClosedConnection(t *testing.T) {
 	server.stop()
 }
 
-func TestClientConnDecoupledFromApplicationRead(t *testing.T) {
+func (s) TestClientConnDecoupledFromApplicationRead(t *testing.T) {
 	connectOptions := ConnectOptions{
 		InitialWindowSize:     defaultWindowSize,
 		InitialConnWindowSize: defaultWindowSize,
@@ -978,7 +1000,9 @@ func TestClientConnDecoupledFromApplicationRead(t *testing.T) {
 	notifyChan := make(chan struct{})
 	server.h.notify = notifyChan
 	server.mu.Unlock()
-	cstream1, err := client.NewStream(context.Background(), &CallHdr{})
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	cstream1, err := client.NewStream(ctx, &CallHdr{})
 	if err != nil {
 		t.Fatalf("Client failed to create first stream. Err: %v", err)
 	}
@@ -1005,7 +1029,7 @@ func TestClientConnDecoupledFromApplicationRead(t *testing.T) {
 	server.h.notify = notifyChan
 	server.mu.Unlock()
 	// Create another stream on client.
-	cstream2, err := client.NewStream(context.Background(), &CallHdr{})
+	cstream2, err := client.NewStream(ctx, &CallHdr{})
 	if err != nil {
 		t.Fatalf("Client failed to create second stream. Err: %v", err)
 	}
@@ -1037,7 +1061,7 @@ func TestClientConnDecoupledFromApplicationRead(t *testing.T) {
 	}
 }
 
-func TestServerConnDecoupledFromApplicationRead(t *testing.T) {
+func (s) TestServerConnDecoupledFromApplicationRead(t *testing.T) {
 	serverConfig := &ServerConfig{
 		InitialWindowSize:     defaultWindowSize,
 		InitialConnWindowSize: defaultWindowSize,
@@ -1060,8 +1084,10 @@ func TestServerConnDecoupledFromApplicationRead(t *testing.T) {
 	for k := range server.conns {
 		st = k.(*http2Server)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	server.mu.Unlock()
-	cstream1, err := client.NewStream(context.Background(), &CallHdr{})
+	cstream1, err := client.NewStream(ctx, &CallHdr{})
 	if err != nil {
 		t.Fatalf("Failed to create 1st stream. Err: %v", err)
 	}
@@ -1070,7 +1096,7 @@ func TestServerConnDecoupledFromApplicationRead(t *testing.T) {
 		t.Fatalf("Client failed to write data. Err: %v", err)
 	}
 	//Client should be able to create another stream and send data on it.
-	cstream2, err := client.NewStream(context.Background(), &CallHdr{})
+	cstream2, err := client.NewStream(ctx, &CallHdr{})
 	if err != nil {
 		t.Fatalf("Failed to create 2nd stream. Err: %v", err)
 	}
@@ -1106,7 +1132,7 @@ func TestServerConnDecoupledFromApplicationRead(t *testing.T) {
 
 }
 
-func TestServerWithMisbehavedClient(t *testing.T) {
+func (s) TestServerWithMisbehavedClient(t *testing.T) {
 	server := setUpServerOnly(t, 0, &ServerConfig{}, suspended)
 	defer server.stop()
 	// Create a client that can override server stream quota.
@@ -1206,7 +1232,7 @@ func TestServerWithMisbehavedClient(t *testing.T) {
 	}
 }
 
-func TestClientWithMisbehavedServer(t *testing.T) {
+func (s) TestClientWithMisbehavedServer(t *testing.T) {
 	// Create a misbehaving server.
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
@@ -1272,12 +1298,12 @@ func TestClientWithMisbehavedServer(t *testing.T) {
 	}()
 	connectCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
 	defer cancel()
-	ct, err := NewClientTransport(connectCtx, context.Background(), TargetInfo{Addr: lis.Addr().String()}, ConnectOptions{}, func() {}, func(GoAwayReason) {}, func() {})
+	ct, err := NewClientTransport(connectCtx, context.Background(), resolver.Address{Addr: lis.Addr().String()}, ConnectOptions{}, func() {}, func(GoAwayReason) {}, func() {})
 	if err != nil {
 		t.Fatalf("Error while creating client transport: %v", err)
 	}
 	defer ct.Close()
-	str, err := ct.NewStream(context.Background(), &CallHdr{})
+	str, err := ct.NewStream(connectCtx, &CallHdr{})
 	if err != nil {
 		t.Fatalf("Error while creating stream: %v", err)
 	}
@@ -1295,14 +1321,16 @@ func TestClientWithMisbehavedServer(t *testing.T) {
 
 var encodingTestStatus = status.New(codes.Internal, "\n")
 
-func TestEncodingRequiredStatus(t *testing.T) {
+func (s) TestEncodingRequiredStatus(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, encodingRequiredStatus)
 	defer cancel()
 	callHdr := &CallHdr{
 		Host:   "localhost",
 		Method: "foo",
 	}
-	s, err := ct.NewStream(context.Background(), callHdr)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	s, err := ct.NewStream(ctx, callHdr)
 	if err != nil {
 		return
 	}
@@ -1321,14 +1349,16 @@ func TestEncodingRequiredStatus(t *testing.T) {
 	server.stop()
 }
 
-func TestInvalidHeaderField(t *testing.T) {
+func (s) TestInvalidHeaderField(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, invalidHeaderField)
 	defer cancel()
 	callHdr := &CallHdr{
 		Host:   "localhost",
 		Method: "foo",
 	}
-	s, err := ct.NewStream(context.Background(), callHdr)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	s, err := ct.NewStream(ctx, callHdr)
 	if err != nil {
 		return
 	}
@@ -1341,12 +1371,14 @@ func TestInvalidHeaderField(t *testing.T) {
 	server.stop()
 }
 
-func TestHeaderChanClosedAfterReceivingAnInvalidHeader(t *testing.T) {
+func (s) TestHeaderChanClosedAfterReceivingAnInvalidHeader(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, invalidHeaderField)
 	defer cancel()
 	defer server.stop()
 	defer ct.Close()
-	s, err := ct.NewStream(context.Background(), &CallHdr{Host: "localhost", Method: "foo"})
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "foo"})
 	if err != nil {
 		t.Fatalf("failed to create the stream")
 	}
@@ -1359,7 +1391,7 @@ func TestHeaderChanClosedAfterReceivingAnInvalidHeader(t *testing.T) {
 	}
 }
 
-func TestIsReservedHeader(t *testing.T) {
+func (s) TestIsReservedHeader(t *testing.T) {
 	tests := []struct {
 		h    string
 		want bool
@@ -1384,7 +1416,7 @@ func TestIsReservedHeader(t *testing.T) {
 	}
 }
 
-func TestContextErr(t *testing.T) {
+func (s) TestContextErr(t *testing.T) {
 	for _, test := range []struct {
 		// input
 		errIn error
@@ -1408,7 +1440,7 @@ type windowSizeConfig struct {
 	clientConn   int32
 }
 
-func TestAccountCheckWindowSizeWithLargeWindow(t *testing.T) {
+func (s) TestAccountCheckWindowSizeWithLargeWindow(t *testing.T) {
 	wc := windowSizeConfig{
 		serverStream: 10 * 1024 * 1024,
 		serverConn:   12 * 1024 * 1024,
@@ -1418,7 +1450,7 @@ func TestAccountCheckWindowSizeWithLargeWindow(t *testing.T) {
 	testFlowControlAccountCheck(t, 1024*1024, wc)
 }
 
-func TestAccountCheckWindowSizeWithSmallWindow(t *testing.T) {
+func (s) TestAccountCheckWindowSizeWithSmallWindow(t *testing.T) {
 	wc := windowSizeConfig{
 		serverStream: defaultWindowSize,
 		// Note this is smaller than initialConnWindowSize which is the current default.
@@ -1429,11 +1461,11 @@ func TestAccountCheckWindowSizeWithSmallWindow(t *testing.T) {
 	testFlowControlAccountCheck(t, 1024*1024, wc)
 }
 
-func TestAccountCheckDynamicWindowSmallMessage(t *testing.T) {
+func (s) TestAccountCheckDynamicWindowSmallMessage(t *testing.T) {
 	testFlowControlAccountCheck(t, 1024, windowSizeConfig{})
 }
 
-func TestAccountCheckDynamicWindowLargeMessage(t *testing.T) {
+func (s) TestAccountCheckDynamicWindowLargeMessage(t *testing.T) {
 	testFlowControlAccountCheck(t, 1024*1024, windowSizeConfig{})
 }
 
@@ -1463,12 +1495,14 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig)
 	for k := range server.conns {
 		st = k.(*http2Server)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	server.mu.Unlock()
 	const numStreams = 10
 	clientStreams := make([]*Stream, numStreams)
 	for i := 0; i < numStreams; i++ {
 		var err error
-		clientStreams[i], err = client.NewStream(context.Background(), &CallHdr{})
+		clientStreams[i], err = client.NewStream(ctx, &CallHdr{})
 		if err != nil {
 			t.Fatalf("Failed to create stream. Err: %v", err)
 		}
@@ -1583,7 +1617,7 @@ func waitWhileTrue(t *testing.T, condition func() (bool, error)) {
 
 // If any error occurs on a call to Stream.Read, future calls
 // should continue to return that same error.
-func TestReadGivesSameErrorAfterAnyErrorOccurs(t *testing.T) {
+func (s) TestReadGivesSameErrorAfterAnyErrorOccurs(t *testing.T) {
 	testRecvBuffer := newRecvBuffer()
 	s := &Stream{
 		ctx:         context.Background(),
@@ -1629,19 +1663,19 @@ func TestReadGivesSameErrorAfterAnyErrorOccurs(t *testing.T) {
 	}
 }
 
-func TestPingPong1B(t *testing.T) {
+func (s) TestPingPong1B(t *testing.T) {
 	runPingPongTest(t, 1)
 }
 
-func TestPingPong1KB(t *testing.T) {
+func (s) TestPingPong1KB(t *testing.T) {
 	runPingPongTest(t, 1024)
 }
 
-func TestPingPong64KB(t *testing.T) {
+func (s) TestPingPong64KB(t *testing.T) {
 	runPingPongTest(t, 65536)
 }
 
-func TestPingPong1MB(t *testing.T) {
+func (s) TestPingPong1MB(t *testing.T) {
 	runPingPongTest(t, 1048576)
 }
 
@@ -1659,7 +1693,9 @@ func runPingPongTest(t *testing.T, msgSize int) {
 		}
 		return false, nil
 	})
-	stream, err := client.NewStream(context.Background(), &CallHdr{})
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	stream, err := client.NewStream(ctx, &CallHdr{})
 	if err != nil {
 		t.Fatalf("Failed to create stream. Err: %v", err)
 	}
@@ -1722,7 +1758,7 @@ func (t *tableSizeLimit) getIndex(i int) uint32 {
 	return t.limits[i]
 }
 
-func TestHeaderTblSize(t *testing.T) {
+func (s) TestHeaderTblSize(t *testing.T) {
 	limits := &tableSizeLimit{}
 	updateHeaderTblSize = func(e *hpack.Encoder, v uint32) {
 		e.SetMaxDynamicTableSizeLimit(v)
@@ -1738,7 +1774,9 @@ func TestHeaderTblSize(t *testing.T) {
 	defer cancel()
 	defer ct.Close()
 	defer server.stop()
-	_, err := ct.NewStream(context.Background(), &CallHdr{})
+	ctx, ctxCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer ctxCancel()
+	_, err := ct.NewStream(ctx, &CallHdr{})
 	if err != nil {
 		t.Fatalf("failed to open stream: %v", err)
 	}
@@ -1807,5 +1845,56 @@ func TestHeaderTblSize(t *testing.T) {
 	}
 	if i == 1000 {
 		t.Fatalf("expected len(limits) = 2 within 10s, got != 2")
+	}
+}
+
+// attrTransportCreds is a transport credential implementation which stores
+// Attributes from the ClientHandshakeInfo struct passed in the context locally
+// for the test to inspect.
+type attrTransportCreds struct {
+	credentials.TransportCredentials
+	attr *attributes.Attributes
+}
+
+func (ac *attrTransportCreds) ClientHandshake(ctx context.Context, addr string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	ai := credentials.ClientHandshakeInfoFromContext(ctx)
+	ac.attr = ai.Attributes
+	return rawConn, nil, nil
+}
+func (ac *attrTransportCreds) Info() credentials.ProtocolInfo {
+	return credentials.ProtocolInfo{}
+}
+func (ac *attrTransportCreds) Clone() credentials.TransportCredentials {
+	return nil
+}
+
+// TestClientHandshakeInfo adds attributes to the resolver.Address passes to
+// NewClientTransport and verifies that these attributes are received by the
+// transport credential handshaker.
+func (s) TestClientHandshakeInfo(t *testing.T) {
+	server := setUpServerOnly(t, 0, &ServerConfig{}, pingpong)
+	defer server.stop()
+
+	const (
+		testAttrKey = "foo"
+		testAttrVal = "bar"
+	)
+	addr := resolver.Address{
+		Addr:       "localhost:" + server.port,
+		Attributes: attributes.New(testAttrKey, testAttrVal),
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
+	defer cancel()
+	creds := &attrTransportCreds{}
+
+	tr, err := NewClientTransport(ctx, context.Background(), addr, ConnectOptions{TransportCredentials: creds}, func() {}, func(GoAwayReason) {}, func() {})
+	if err != nil {
+		t.Fatalf("NewClientTransport(): %v", err)
+	}
+	defer tr.Close()
+
+	wantAttr := attributes.New(testAttrKey, testAttrVal)
+	if gotAttr := creds.attr; !cmp.Equal(gotAttr, wantAttr, cmp.AllowUnexported(attributes.Attributes{})) {
+		t.Fatalf("received attributes %v in creds, want %v", gotAttr, wantAttr)
 	}
 }

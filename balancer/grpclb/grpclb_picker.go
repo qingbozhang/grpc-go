@@ -29,7 +29,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// rpcStats is same as lbmpb.ClientStats, except that numCallsDropped is a map
+// rpcStats is same as lbpb.ClientStats, except that numCallsDropped is a map
 // instead of a slice.
 type rpcStats struct {
 	// Only access the following fields atomically.
@@ -47,6 +47,14 @@ func newRPCStats() *rpcStats {
 	return &rpcStats{
 		numCallsDropped: make(map[string]int64),
 	}
+}
+
+func isZeroStats(stats *lbpb.ClientStats) bool {
+	return len(stats.CallsFinishedWithDrop) == 0 &&
+		stats.NumCallsStarted == 0 &&
+		stats.NumCallsFinished == 0 &&
+		stats.NumCallsFinishedWithClientFailedToSend == 0 &&
+		stats.NumCallsFinishedKnownReceived == 0
 }
 
 // toClientStats converts rpcStats to lbpb.ClientStats, and clears rpcStats.
